@@ -22,9 +22,29 @@ Core blockchain and IPFS library for the YAMO Protocol.
 
 ## Installation
 
+### From GitHub (Current Method)
+
+```bash
+# Clone the repository
+git clone https://github.com/yamo-protocol/yamo-core.git
+cd yamo-core
+
+# Install dependencies
+npm install
+
+# Build
+npm run build
+```
+
+### From NPM (Coming Soon)
+
+Once published to npm, you'll be able to install with:
+
 ```bash
 npm install @yamo/core
 ```
+
+_Note: The package is not yet published to npm. Please use the GitHub installation method above, or install as a dependency in other YAMO packages (which will automatically handle it via GitHub)._
 
 ## Usage
 
