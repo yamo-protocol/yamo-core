@@ -8,6 +8,38 @@ import chalk from "chalk";
 export interface IpfsUploadOptions {
   content: string;
   files?: { name: string, content: string }[];
+  encryptionKey?: string;
+}
+
+interface EncryptionMetadata {
+  version: string;
+  algorithm: string;
+  salt: string;
+  files: {
+    [filename: string]: {
+      iv: string;
+      authTag: string;
+    };
+  };
+}
+
+// Encryption Helpers
+function deriveKey(password: string, salt: Buffer): Buffer {
+  return crypto.scryptSync(password, salt, 32);
+}
+
+function encryptBuffer(buffer: Buffer, key: Buffer): { encrypted: Buffer, iv: string, authTag: string } {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return { encrypted, iv: iv.toString('hex'), authTag: authTag.toString('hex') };
+}
+
+function decryptBuffer(encrypted: Buffer, key: Buffer, iv: string, authTag: string): Buffer {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'));
+  decipher.setAuthTag(Buffer.from(authTag, 'hex'));
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
 
 /**
@@ -44,21 +76,61 @@ export class IpfsManager {
   private async uploadMock(options: IpfsUploadOptions): Promise<string> {
     console.log(chalk.yellow("Using Mock IPFS..."));
     
-    // Deterministic hash based on main content
+    // Deterministic hash based on main content (original content for stability)
     const hash = crypto.createHash("sha256").update(options.content).digest("hex");
     const cid = `QmFake${hash.substring(0, 40)}`;
     
-    // Save main file
-    fs.writeFileSync(path.join(this.mockStorageDir, cid), options.content);
+    const bundleDir = path.join(this.mockStorageDir, `${cid}_bundle`);
+    if (!fs.existsSync(bundleDir)) fs.mkdirSync(bundleDir);
+
+    let encryptionMetadata: EncryptionMetadata | null = null;
+    let key: Buffer | null = null;
+
+    if (options.encryptionKey) {
+      const salt = crypto.randomBytes(16);
+      key = deriveKey(options.encryptionKey, salt);
+      encryptionMetadata = {
+        version: "1.0",
+        algorithm: "aes-256-gcm",
+        salt: salt.toString('hex'),
+        files: {}
+      };
+    }
+
+    // Process main file (block.yamo)
+    let mainContentBuffer = Buffer.from(options.content);
+    if (encryptionMetadata && key) {
+      const { encrypted, iv, authTag } = encryptBuffer(mainContentBuffer, key);
+      mainContentBuffer = encrypted as any;
+      encryptionMetadata.files["block.yamo"] = { iv, authTag };
+    }
+    fs.writeFileSync(path.join(bundleDir, "block.yamo"), mainContentBuffer);
     
-    // Save bundle if present
+    // Also save legacy single file for non-bundle lookups (only if not encrypted, or maybe just skip?)
+    // If encrypted, single file lookup of just content is confusing. We will rely on bundle structure.
+    // However, to keep mock consistent, we might write it. But if it's encrypted, it's garbage.
+    // We'll write the main content to the CID file (encrypted if enabled).
+    fs.writeFileSync(path.join(this.mockStorageDir, cid), mainContentBuffer);
+
+    // Process artifacts
     if (options.files) {
-      const bundleDir = path.join(this.mockStorageDir, `${cid}_bundle`);
-      if (!fs.existsSync(bundleDir)) fs.mkdirSync(bundleDir);
-      
       for (const file of options.files) {
-        fs.writeFileSync(path.join(bundleDir, file.name), file.content);
+        let fileBuffer = Buffer.from(file.content);
+        if (encryptionMetadata && key) {
+          const { encrypted, iv, authTag } = encryptBuffer(fileBuffer, key);
+           fileBuffer = encrypted as any;
+          encryptionMetadata.files[file.name] = { iv, authTag };
+        }
+        fs.writeFileSync(path.join(bundleDir, file.name), fileBuffer);
       }
+    }
+
+    // Save metadata if encrypted
+    if (encryptionMetadata) {
+      fs.writeFileSync(
+        path.join(bundleDir, "encryption_metadata.json"),
+        JSON.stringify(encryptionMetadata, null, 2)
+      );
     }
 
     return cid;
@@ -68,33 +140,63 @@ export class IpfsManager {
     console.log(chalk.yellow("Using Real IPFS (Pinata)..."));
     const endpoint = "https://api.pinata.cloud/pinning/pinFileToIPFS";
     const data = new FormData();
+    const bundleDirName = `yamo_bundle_${Date.now()}`;
 
-    if (options.files && options.files.length > 0) {
-      // Deep Bundle Mode
-      const bundleDir = `yamo_bundle_${Date.now()}`;
+    let encryptionMetadata: EncryptionMetadata | null = null;
+    let key: Buffer | null = null;
 
-      // Add main block if not already in files
-      const hasBlockYamo = options.files.some(f => f.name === "block.yamo");
-      if (!hasBlockYamo) {
-        data.append("file", Buffer.from(options.content), {
-          filepath: `${bundleDir}/block.yamo`,
-          contentType: "text/plain",
-        });
-      }
+    if (options.encryptionKey) {
+      const salt = crypto.randomBytes(16);
+      key = deriveKey(options.encryptionKey, salt);
+      encryptionMetadata = {
+        version: "1.0",
+        algorithm: "aes-256-gcm",
+        salt: salt.toString('hex'),
+        files: {}
+      };
+    }
 
-      // Add artifacts
-      for (const file of options.files) {
-        data.append("file", Buffer.from(file.content), {
-          filepath: `${bundleDir}/${file.name}`,
-          contentType: "text/plain",
-        });
-      }
-    } else {
-      // Single File Mode
-      data.append("file", Buffer.from(options.content), {
-        filename: `yamo_block_${Date.now()}.txt`,
-        contentType: "text/plain",
+    // Helper to add file to FormData
+    const addFile = (name: string, content: Buffer) => {
+       data.append("file", content, {
+        filepath: `${bundleDirName}/${name}`,
+        contentType: "application/octet-stream", // Binary if encrypted, but safe generic
       });
+    };
+
+    // Process main block
+    let mainContentBuffer = Buffer.from(options.content);
+    if (encryptionMetadata && key) {
+      const { encrypted, iv, authTag } = encryptBuffer(mainContentBuffer, key);
+      mainContentBuffer = encrypted as any;
+      encryptionMetadata.files["block.yamo"] = { iv, authTag };
+    }
+    
+    // Check if block.yamo is explicitly in files (rare but possible)
+    const hasBlockYamo = options.files?.some(f => f.name === "block.yamo");
+    if (!hasBlockYamo) {
+      addFile("block.yamo", mainContentBuffer);
+    }
+
+    // Process artifacts
+    if (options.files) {
+      for (const file of options.files) {
+        if (file.name === "block.yamo" && !hasBlockYamo) continue; // Already handled
+        
+        let fileBuffer = Buffer.from(file.content);
+        if (encryptionMetadata && key) {
+           const { encrypted, iv, authTag } = encryptBuffer(fileBuffer, key);
+            fileBuffer = encrypted as any;
+           encryptionMetadata.files[file.name] = { iv, authTag };
+        }
+        addFile(file.name, fileBuffer);
+      }
+    }
+
+    // Add metadata file
+    if (encryptionMetadata) {
+      const metadataBuffer = Buffer.from(JSON.stringify(encryptionMetadata, null, 2));
+      addFile("encryption_metadata.json", metadataBuffer);
     }
 
     const headers: any = { ...data.getHeaders() };
@@ -117,33 +219,75 @@ export class IpfsManager {
     }
   }
 
-  async download(cid: string): Promise<string> {
+  async download(cid: string, encryptionKey?: string): Promise<string> {
     const gateway = process.env.IPFS_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
-    try {
+    
+    // Helper to fetch/read file
+    const getFile = async (filename: string): Promise<Buffer | null> => {
       if (!this.useRealIpfs) {
-        // Mock download
-        const p = path.join(this.mockStorageDir, cid);
-        if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
-        // Check for bundle
-        const bundleP = path.join(this.mockStorageDir, `${cid}_bundle`, "block.yamo");
-        if (fs.existsSync(bundleP)) return fs.readFileSync(bundleP, "utf8");
-        throw new Error("Mock file not found");
+         // Try bundle path first
+         const bundleP = path.join(this.mockStorageDir, `${cid}_bundle`, filename);
+         if (fs.existsSync(bundleP)) return fs.readFileSync(bundleP);
+         // Try direct path (only for main file/cid)
+         if (filename === "block.yamo" || filename === cid) {
+             const directP = path.join(this.mockStorageDir, cid);
+             if (fs.existsSync(directP)) return fs.readFileSync(directP);
+         }
+         return null;
+      } else {
+        try {
+          const url = `${gateway}${cid}/${filename}`;
+          const res = await axios.get(url, { responseType: 'arraybuffer' });
+          return Buffer.from(res.data);
+        } catch (e) {
+          // If trying to get block.yamo fails, maybe it's a single file CID?
+          if (filename === "block.yamo") {
+             try {
+               const url = `${gateway}${cid}`;
+               const res = await axios.get(url, { responseType: 'arraybuffer' });
+               return Buffer.from(res.data);
+             } catch (e2) { return null; }
+          }
+          return null;
+        }
+      }
+    };
+
+    // Check for encryption metadata
+    const metadataBuf = await getFile("encryption_metadata.json");
+    
+    if (metadataBuf) {
+      if (!encryptionKey) {
+        throw new Error(`CID ${cid} is encrypted. Please provide an encryption key.`);
+      }
+      
+      const metadata: EncryptionMetadata = JSON.parse(metadataBuf.toString());
+      if (metadata.algorithm !== "aes-256-gcm") {
+        throw new Error(`Unsupported encryption algorithm: ${metadata.algorithm}`);
+      }
+      
+      const key = deriveKey(encryptionKey, Buffer.from(metadata.salt, 'hex'));
+      const fileMeta = metadata.files["block.yamo"];
+      
+      if (!fileMeta) {
+        throw new Error("Encrypted bundle missing block.yamo metadata");
       }
 
-      // Real download
-      const res = await axios.get(`${gateway}${cid}/block.yamo`); // Try bundle path first
-      return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-    } catch (error) {
-      // Fallback to direct file (not bundle)
-      try {
-        if (this.useRealIpfs) {
-            const res = await axios.get(`${gateway}${cid}`);
-            return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-        }
-        throw error;
-      } catch (e) {
-        throw new Error(`Failed to download CID ${cid}`);
-      }
+      const encryptedContent = await getFile("block.yamo");
+      if (!encryptedContent) throw new Error("Could not find block.yamo in encrypted bundle");
+
+      const decrypted = decryptBuffer(encryptedContent, key, fileMeta.iv, fileMeta.authTag);
+      return decrypted.toString('utf8');
     }
+
+    // Not encrypted
+    const content = await getFile("block.yamo");
+    if (content) return content.toString('utf8');
+    
+    // Fallback for single file CIDs (legacy or non-bundle)
+    const direct = await getFile(cid); // This effectively retries the gateway root
+    if (direct) return direct.toString('utf8');
+
+    throw new Error(`Failed to download CID ${cid}`);
   }
 }
