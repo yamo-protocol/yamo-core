@@ -33,3 +33,4 @@ yarn-error.log*
 # Testing
 coverage/
 .nyc_output/
+ipfs_storage/
