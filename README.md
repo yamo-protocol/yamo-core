@@ -1,5 +1,7 @@
 # @yamo/core
 
+[![npm version](https://img.shields.io/npm/v/@yamo/core)](https://www.npmjs.com/package/@yamo/core)
+
 The core logic library for the YAMO Protocol. It handles:
 - Blockchain interactions (reading/writing to the Registry).
 - IPFS Storage (Mock and Pinata).
