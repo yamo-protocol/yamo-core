@@ -28,7 +28,7 @@ export class YamoChainClient {
 
   getContract(withSigner = false) {
     if (!this.contractAddress) throw new Error("Contract address not configured");
-    
+
     if (withSigner && !this.wallet) {
         throw new Error("Private key required for write operations");
     }
@@ -38,6 +38,10 @@ export class YamoChainClient {
       YAMO_REGISTRY_ABI,
       withSigner ? this.wallet : this.provider
     );
+  }
+
+  getContractAddress(): string {
+    return this.contractAddress;
   }
 
   async submitBlock(
