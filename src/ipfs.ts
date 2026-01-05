@@ -128,6 +128,33 @@ export function validatePasswordStrength(
   }
 }
 
+// Security Helper: Prevent path traversal attacks
+function sanitizeFilename(filename: string): string {
+  // Get just the basename (removes any directory components)
+  const basename = path.basename(filename);
+
+  // Reject if the basename doesn't match the original (indicates path traversal attempt)
+  // or if it starts with a dot (hidden files could be security risk)
+  if (basename !== filename) {
+    throw new Error(
+      `Invalid filename: "${filename}". Filenames cannot contain directory separators.`
+    );
+  }
+
+  if (basename.startsWith('.')) {
+    throw new Error(
+      `Invalid filename: "${filename}". Filenames cannot start with a dot.`
+    );
+  }
+
+  // Reject empty or whitespace-only names
+  if (!basename.trim()) {
+    throw new Error(`Invalid filename: Filename cannot be empty or whitespace.`);
+  }
+
+  return basename;
+}
+
 // Encryption Helpers
 function deriveKey(password: string, salt: Buffer): Buffer {
   return crypto.scryptSync(password, salt, 32);
@@ -148,6 +175,51 @@ function decryptBuffer(encrypted: Buffer, key: Buffer, iv: string, authTag: stri
 }
 
 /**
+ * Prepares encryption key and metadata from password.
+ * Returns null if no encryption key provided.
+ */
+function prepareEncryption(encryptionKey?: string): {
+  key: Buffer;
+  metadata: EncryptionMetadata;
+} | null {
+  if (!encryptionKey) return null;
+
+  // Validate password strength before encryption
+  validatePasswordStrength(encryptionKey);
+
+  const salt = crypto.randomBytes(16);
+  const key = deriveKey(encryptionKey, salt);
+  const metadata: EncryptionMetadata = {
+    version: "1.0",
+    algorithm: "aes-256-gcm",
+    salt: salt.toString('hex'),
+    files: {}
+  };
+
+  return { key, metadata };
+}
+
+/**
+ * Encrypts content and updates metadata. Returns encrypted buffer.
+ * If encryption context not provided, returns original buffer.
+ */
+function encryptContent(
+  content: string,
+  filename: string,
+  encryptionContext: { key: Buffer; metadata: EncryptionMetadata } | null
+): Buffer {
+  const buffer = Buffer.from(content);
+
+  if (encryptionContext) {
+    const { encrypted, iv, authTag } = encryptBuffer(buffer, encryptionContext.key);
+    encryptionContext.metadata.files[filename] = { iv, authTag };
+    return encrypted;
+  }
+
+  return buffer;
+}
+
+/**
  * Wrapper for decryptBuffer with enhanced error messages.
  * Provides context-specific error information for debugging.
  */
@@ -160,7 +232,8 @@ function decryptBufferSafe(
 ): Buffer {
   try {
     return decryptBuffer(encrypted, key, iv, authTag);
-  } catch (e: any) {
+  } catch (e: unknown) {
+    const errorMessage = e instanceof Error ? e.message : String(e);
     throw new Error(
       `Decryption failed${context ? ` for ${context}` : ""}. ` +
       `Possible causes:\n` +
@@ -168,14 +241,37 @@ function decryptBufferSafe(
       `  • Data corrupted during transmission\n` +
       `  • Encryption metadata tampered with\n` +
       `  • Unsupported algorithm version\n` +
-      `Original error: ${e.message}`
+      `Original error: ${errorMessage}`
     );
   }
 }
 
 /**
- * Unified IPFS Manager
- * Handles Mock vs Real (Pinata) logic internally.
+ * Unified IPFS Manager for uploading and downloading YAMO blocks.
+ * Supports both mock (local filesystem) and real IPFS (Pinata) storage.
+ * Provides optional AES-256-GCM encryption for secure off-chain storage.
+ *
+ * @example
+ * ```typescript
+ * // Mock IPFS (local storage)
+ * const ipfs = new IpfsManager({ useRealIpfs: false });
+ *
+ * // Real IPFS with Pinata
+ * const ipfs = new IpfsManager({
+ *   useRealIpfs: true,
+ *   jwt: "your-pinata-jwt"
+ * });
+ *
+ * // Upload with encryption
+ * const cid = await ipfs.upload({
+ *   content: "yamo block content",
+ *   files: [{ name: "output.json", content: "{}" }],
+ *   encryptionKey: "MyStr0ng!Password123"
+ * });
+ *
+ * // Download with decryption
+ * const content = await ipfs.download(cid, "MyStr0ng!Password123");
+ * ```
  */
 export class IpfsManager {
   private useRealIpfs: boolean;
@@ -184,6 +280,14 @@ export class IpfsManager {
   private jwt: string;
   private mockStorageDir: string;
 
+  /**
+   * Creates a new IpfsManager instance.
+   * @param options - Configuration options
+   * @param options.useRealIpfs - If true, uses Pinata for real IPFS. If false, uses local mock storage. Defaults to USE_REAL_IPFS environment variable
+   * @param options.apiKey - Pinata API key (alternative to JWT). Defaults to PINATA_API_KEY environment variable
+   * @param options.apiSecret - Pinata API secret (alternative to JWT). Defaults to PINATA_SECRET_KEY environment variable
+   * @param options.jwt - Pinata JWT token (recommended over API key). Defaults to PINATA_JWT environment variable
+   */
   constructor(options?: { useRealIpfs?: boolean, apiKey?: string, apiSecret?: string, jwt?: string }) {
     this.useRealIpfs = options?.useRealIpfs ?? (process.env.USE_REAL_IPFS === "true");
     this.apiKey = options?.apiKey ?? process.env.PINATA_API_KEY ?? "";
@@ -197,6 +301,35 @@ export class IpfsManager {
     }
   }
 
+  /**
+   * Uploads a YAMO block bundle to IPFS (or mock storage).
+   * Optionally encrypts all files with AES-256-GCM encryption.
+   * @param options - Upload options
+   * @param options.content - Main YAMO block content (stored as block.yamo)
+   * @param options.files - Optional array of additional files to include in the bundle
+   * @param options.encryptionKey - Optional password for encrypting the bundle. Must meet strength requirements.
+   * @returns The IPFS CID (Content Identifier) for the uploaded bundle
+   * @throws {Error} If encryption key doesn't meet strength requirements
+   * @throws {Error} If file names contain invalid characters or path traversal attempts
+   * @throws {Error} If upload to IPFS fails
+   * @example
+   * ```typescript
+   * // Upload unencrypted
+   * const cid = await ipfs.upload({
+   *   content: "yamo block data",
+   *   files: [
+   *     { name: "output.json", content: "{}" },
+   *     { name: "metrics.csv", content: "..." }
+   *   ]
+   * });
+   *
+   * // Upload with encryption
+   * const cid = await ipfs.upload({
+   *   content: "sensitive data",
+   *   encryptionKey: "MySecure!Pass123"
+   * });
+   * ```
+   */
   async upload(options: IpfsUploadOptions): Promise<string> {
     if (this.useRealIpfs) {
       return this.uploadReal(options);
@@ -214,52 +347,27 @@ export class IpfsManager {
     const bundleDir = path.join(this.mockStorageDir, `${cid}_bundle`);
     if (!fs.existsSync(bundleDir)) fs.mkdirSync(bundleDir);
 
-    let encryptionMetadata: EncryptionMetadata | null = null;
-    let key: Buffer | null = null;
-
-    if (options.encryptionKey) {
-      // Validate password strength before encryption
-      validatePasswordStrength(options.encryptionKey);
-
-      const salt = crypto.randomBytes(16);
-      key = deriveKey(options.encryptionKey, salt);
-      encryptionMetadata = {
-        version: "1.0",
-        algorithm: "aes-256-gcm",
-        salt: salt.toString('hex'),
-        files: {}
-      };
-    }
+    // Prepare encryption if needed
+    const encryptionContext = prepareEncryption(options.encryptionKey);
 
     // Process main file (block.yamo)
-    let mainContentBuffer = Buffer.from(options.content);
-    if (encryptionMetadata && key) {
-      const { encrypted, iv, authTag } = encryptBuffer(mainContentBuffer, key);
-      mainContentBuffer = encrypted as any;
-      encryptionMetadata.files["block.yamo"] = { iv, authTag };
-    }
-
-    // ONLY write to bundle directory (no duplicate {cid} file)
+    const mainContentBuffer = encryptContent(options.content, "block.yamo", encryptionContext);
     fs.writeFileSync(path.join(bundleDir, "block.yamo"), mainContentBuffer);
 
     // Process artifacts
     if (options.files) {
       for (const file of options.files) {
-        let fileBuffer = Buffer.from(file.content);
-        if (encryptionMetadata && key) {
-          const { encrypted, iv, authTag } = encryptBuffer(fileBuffer, key);
-           fileBuffer = encrypted as any;
-          encryptionMetadata.files[file.name] = { iv, authTag };
-        }
-        fs.writeFileSync(path.join(bundleDir, file.name), fileBuffer);
+        const safeName = sanitizeFilename(file.name);
+        const fileBuffer = encryptContent(file.content, safeName, encryptionContext);
+        fs.writeFileSync(path.join(bundleDir, safeName), fileBuffer);
       }
     }
 
     // Save metadata if encrypted
-    if (encryptionMetadata) {
+    if (encryptionContext) {
       fs.writeFileSync(
         path.join(bundleDir, "encryption_metadata.json"),
-        JSON.stringify(encryptionMetadata, null, 2)
+        JSON.stringify(encryptionContext.metadata, null, 2)
       );
     }
 
@@ -272,22 +380,8 @@ export class IpfsManager {
     const data = new FormData();
     const bundleDirName = `yamo_bundle_${Date.now()}`;
 
-    let encryptionMetadata: EncryptionMetadata | null = null;
-    let key: Buffer | null = null;
-
-    if (options.encryptionKey) {
-      // Validate password strength before encryption
-      validatePasswordStrength(options.encryptionKey);
-
-      const salt = crypto.randomBytes(16);
-      key = deriveKey(options.encryptionKey, salt);
-      encryptionMetadata = {
-        version: "1.0",
-        algorithm: "aes-256-gcm",
-        salt: salt.toString('hex'),
-        files: {}
-      };
-    }
+    // Prepare encryption if needed
+    const encryptionContext = prepareEncryption(options.encryptionKey);
 
     // Helper to add file to FormData
     const addFile = (name: string, content: Buffer) => {
@@ -298,13 +392,8 @@ export class IpfsManager {
     };
 
     // Process main block
-    let mainContentBuffer = Buffer.from(options.content);
-    if (encryptionMetadata && key) {
-      const { encrypted, iv, authTag } = encryptBuffer(mainContentBuffer, key);
-      mainContentBuffer = encrypted as any;
-      encryptionMetadata.files["block.yamo"] = { iv, authTag };
-    }
-    
+    const mainContentBuffer = encryptContent(options.content, "block.yamo", encryptionContext);
+
     // Check if block.yamo is explicitly in files (rare but possible)
     const hasBlockYamo = options.files?.some(f => f.name === "block.yamo");
     if (!hasBlockYamo) {
@@ -314,25 +403,21 @@ export class IpfsManager {
     // Process artifacts
     if (options.files) {
       for (const file of options.files) {
-        if (file.name === "block.yamo" && !hasBlockYamo) continue; // Already handled
-        
-        let fileBuffer = Buffer.from(file.content);
-        if (encryptionMetadata && key) {
-           const { encrypted, iv, authTag } = encryptBuffer(fileBuffer, key);
-            fileBuffer = encrypted as any;
-           encryptionMetadata.files[file.name] = { iv, authTag };
-        }
-        addFile(file.name, fileBuffer);
+        const safeName = sanitizeFilename(file.name);
+        if (safeName === "block.yamo" && !hasBlockYamo) continue; // Already handled
+
+        const fileBuffer = encryptContent(file.content, safeName, encryptionContext);
+        addFile(safeName, fileBuffer);
       }
     }
 
     // Add metadata file
-    if (encryptionMetadata) {
-      const metadataBuffer = Buffer.from(JSON.stringify(encryptionMetadata, null, 2));
+    if (encryptionContext) {
+      const metadataBuffer = Buffer.from(JSON.stringify(encryptionContext.metadata, null, 2));
       addFile("encryption_metadata.json", metadataBuffer);
     }
 
-    const headers: any = { ...data.getHeaders() };
+    const headers: Record<string, string> = { ...data.getHeaders() };
     if (this.jwt) {
       headers["Authorization"] = `Bearer ${this.jwt}`;
     } else {
@@ -346,12 +431,34 @@ export class IpfsManager {
         headers: headers,
       });
       return res.data.IpfsHash;
-    } catch (error: any) {
-      console.error(chalk.red("IPFS Upload Error:"), error.response?.data || error.message);
+    } catch (error: unknown) {
+      const errorData = error instanceof Error && 'response' in error
+        ? (error as { response?: { data?: unknown } }).response?.data
+        : undefined;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error(chalk.red("IPFS Upload Error:"), errorData || errorMessage);
       throw new Error("Failed to upload to IPFS");
     }
   }
 
+  /**
+   * Downloads and decrypts a YAMO block from IPFS (or mock storage).
+   * Returns only the main block content (block.yamo).
+   * @param cid - The IPFS CID to download
+   * @param encryptionKey - Optional decryption password (required if bundle is encrypted)
+   * @returns The main block content as a string
+   * @throws {Error} If CID is encrypted but no decryption key provided
+   * @throws {Error} If decryption fails (wrong key or corrupted data)
+   * @throws {Error} If CID not found
+   * @example
+   * ```typescript
+   * // Download unencrypted block
+   * const content = await ipfs.download("QmTest123...");
+   *
+   * // Download encrypted block
+   * const content = await ipfs.download("QmTest123...", "MySecure!Pass123");
+   * ```
+   */
   async download(cid: string, encryptionKey?: string): Promise<string> {
     const gateway = process.env.IPFS_GATEWAY || "https://gateway.pinata.cloud/ipfs/";
     
@@ -420,8 +527,25 @@ export class IpfsManager {
   }
 
   /**
-   * Downloads complete bundle including all files (encrypted or not).
-   * Returns block content + all artifact files.
+   * Downloads a complete YAMO bundle including all files.
+   * Returns the main block content plus all additional artifact files.
+   * @param cid - The IPFS CID to download
+   * @param encryptionKey - Optional decryption password (required if bundle is encrypted)
+   * @returns Bundle data containing block content, all files, and encryption metadata
+   * @throws {Error} If CID is encrypted but no decryption key provided
+   * @throws {Error} If decryption fails for any file
+   * @example
+   * ```typescript
+   * // Download unencrypted bundle
+   * const bundle = await ipfs.downloadBundle("QmTest123...");
+   * console.log("Block:", bundle.block);
+   * console.log("Files:", Object.keys(bundle.files));
+   *
+   * // Download encrypted bundle
+   * const bundle = await ipfs.downloadBundle("QmTest123...", "MySecure!Pass123");
+   * console.log("Output:", bundle.files["output.json"]);
+   * console.log("Encrypted:", bundle.metadata?.hasEncryption);
+   * ```
    */
   async downloadBundle(
     cid: string,
@@ -495,7 +619,7 @@ export class IpfsManager {
           blockMeta.authTag
         );
         result.block = decryptedBlock.toString('utf8');
-      } catch (e: any) {
+      } catch (e: unknown) {
         throw new Error(
           "Failed to decrypt block.yamo. " +
           "This usually means the encryption key is incorrect."

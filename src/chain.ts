@@ -12,17 +12,39 @@ export const YAMO_REGISTRY_ABI = [
   "event YAMOBlockSubmittedV2(string indexed blockId, bytes32 contentHash, string ipfsCID)"
 ];
 
+/**
+ * Client for interacting with the YAMO Registry smart contract on the blockchain.
+ * Provides methods for submitting blocks, retrieving block data, and querying the chain state.
+ */
 export class YamoChainClient {
   private provider: ethers.Provider;
   private wallet?: ethers.Wallet;
   private contractAddress: string;
 
+  /**
+   * Creates a new YamoChainClient instance.
+   * @param rpcUrl - The RPC URL for connecting to the blockchain. Defaults to RPC_URL environment variable or "http://127.0.0.1:8545"
+   * @param privateKey - Private key for signing transactions. If not provided, write operations will fail. Defaults to PRIVATE_KEY environment variable
+   * @param contractAddress - Address of the YAMO Registry contract. Defaults to CONTRACT_ADDRESS environment variable
+   * @example
+   * ```typescript
+   * // Read-only client
+   * const client = new YamoChainClient("https://rpc.example.com");
+   *
+   * // Client with write capabilities
+   * const client = new YamoChainClient(
+   *   "https://rpc.example.com",
+   *   "0x1234...",
+   *   "0xabcd..."
+   * );
+   * ```
+   */
   constructor(rpcUrl?: string, privateKey?: string, contractAddress?: string) {
     this.contractAddress = contractAddress ?? process.env.CONTRACT_ADDRESS ?? "";
     const url = rpcUrl ?? process.env.RPC_URL ?? "http://127.0.0.1:8545";
-    
+
     this.provider = new ethers.JsonRpcProvider(url);
-    
+
     const pk = privateKey ?? process.env.PRIVATE_KEY;
     if (pk) {
       this.wallet = new ethers.Wallet(pk, this.provider);
@@ -43,10 +65,47 @@ export class YamoChainClient {
     );
   }
 
+  /**
+   * Returns the configured contract address.
+   * @returns The YAMO Registry contract address
+   */
   getContractAddress(): string {
     return this.contractAddress;
   }
 
+  /**
+   * Submits a new YAMO block to the blockchain registry.
+   * Uses V2 submission if ipfsCID is provided, otherwise uses V1.
+   * @param blockId - Unique identifier for the block
+   * @param previousBlock - Hash of the previous block (use "0x0000..." for genesis block)
+   * @param contentHash - SHA-256 hash of the block content (as hex string, with or without "0x" prefix)
+   * @param consensusType - Type of consensus mechanism used (e.g., "ai", "pow", "pos")
+   * @param ledger - Ledger identifier (e.g., "main", "test")
+   * @param ipfsCID - Optional IPFS CID for V2 blocks with off-chain storage
+   * @returns Transaction receipt
+   * @throws {Error} If contract address not configured or private key missing
+   * @example
+   * ```typescript
+   * // Submit V1 block
+   * await client.submitBlock(
+   *   "block-1",
+   *   "0x0000000000000000000000000000000000000000000000000000000000000000",
+   *   "0xabcd1234...",
+   *   "ai",
+   *   "main"
+   * );
+   *
+   * // Submit V2 block with IPFS
+   * await client.submitBlock(
+   *   "block-2",
+   *   "0x1234...",
+   *   "0xabcd...",
+   *   "ai",
+   *   "main",
+   *   "QmTest123..."
+   * );
+   * ```
+   */
   async submitBlock(
     blockId: string,
     previousBlock: string,
@@ -73,6 +132,20 @@ export class YamoChainClient {
     return tx;
   }
 
+  /**
+   * Retrieves block data from the blockchain registry by block ID.
+   * @param blockId - The unique identifier of the block to retrieve
+   * @returns Block data including metadata and IPFS CID (for V2 blocks), or null if block not found
+   * @example
+   * ```typescript
+   * const block = await client.getBlock("block-1");
+   * if (block) {
+   *   console.log("Block:", block.blockId);
+   *   console.log("Content Hash:", block.contentHash);
+   *   console.log("IPFS CID:", block.ipfsCID);
+   * }
+   * ```
+   */
   async getBlock(blockId: string) {
     const contract = this.getContract(false);
     try {
@@ -106,8 +179,18 @@ export class YamoChainClient {
   }
 
   /**
-   * Get the latest block's contentHash directly from contract state
-   * This is the recommended method for chain continuation
+   * Gets the latest block's content hash directly from contract state.
+   * This is the recommended method for chain continuation as it's more efficient than getLatestBlock().
+   * @returns The content hash of the most recently submitted block as a hex string
+   * @throws {Error} If contract address not configured
+   * @example
+   * ```typescript
+   * const latestHash = await client.getLatestBlockHash();
+   * console.log("Latest block hash:", latestHash);
+   *
+   * // Use as previousBlock for next submission
+   * await client.submitBlock("new-block", latestHash, ...);
+   * ```
    */
   async getLatestBlockHash(): Promise<string> {
     const contract = this.getContract(false);
@@ -115,6 +198,21 @@ export class YamoChainClient {
     return hash;
   }
 
+  /**
+   * Retrieves the complete latest block data by querying blockchain events.
+   * This method is more expensive than getLatestBlockHash() but returns full block metadata.
+   * Attempts to find V2 events first, then falls back to V1 events if not found.
+   * @returns Complete block data including all metadata and optional IPFS CID, or null if no blocks exist
+   * @example
+   * ```typescript
+   * const latestBlock = await client.getLatestBlock();
+   * if (latestBlock) {
+   *   console.log("Latest block ID:", latestBlock.blockId);
+   *   console.log("Timestamp:", latestBlock.timestamp);
+   *   console.log("Consensus:", latestBlock.consensusType);
+   * }
+   * ```
+   */
   async getLatestBlock(): Promise<{
     blockId: string;
     previousBlock: string;
@@ -128,7 +226,7 @@ export class YamoChainClient {
     const contract = this.getContract(false);
 
     try {
-      let latestEvent: any = null;
+      let latestEvent: ethers.EventLog | null = null;
       let latestBlockNumber = 0;
 
       // Try V2 events first (with IPFS)

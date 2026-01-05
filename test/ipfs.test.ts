@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { IpfsManager, validatePasswordStrength, DEFAULT_PASSWORD_POLICY } from "./ipfs.js";
+import { IpfsManager, validatePasswordStrength, DEFAULT_PASSWORD_POLICY } from "../src/ipfs.js";
 import axios from "axios";
 import fs from "fs";
 import path from "path";
@@ -120,6 +120,48 @@ describe("IpfsManager", () => {
       // Should have encryption metadata
       const bundleDir = path.join(mockStorageDir, `${cid}_bundle`);
       expect(fs.existsSync(path.join(bundleDir, "encryption_metadata.json"))).toBe(true);
+    });
+
+    it("should reject path traversal attempts in filenames", async () => {
+      const ipfs = new IpfsManager({ useRealIpfs: false });
+
+      // Test various path traversal attempts
+      const pathTraversalAttempts = [
+        "../etc/passwd",
+        "../../etc/passwd",
+        "../../../malicious.txt",
+        "subdir/../../../outside.txt",
+        "./.hidden",
+        ".env"
+      ];
+
+      for (const maliciousName of pathTraversalAttempts) {
+        await expect(ipfs.upload({
+          content: "test",
+          files: [{ name: maliciousName, content: "malicious" }]
+        })).rejects.toThrow(/Invalid filename/);
+      }
+    });
+
+    it("should accept valid filenames", async () => {
+      const ipfs = new IpfsManager({ useRealIpfs: false });
+
+      const validNames = [
+        "output.json",
+        "result.txt",
+        "data_file.csv",
+        "image-2024.png"
+      ];
+
+      for (const validName of validNames) {
+        const cid = await ipfs.upload({
+          content: "test",
+          files: [{ name: validName, content: "valid content" }]
+        });
+
+        const bundleDir = path.join(mockStorageDir, `${cid}_bundle`);
+        expect(fs.existsSync(path.join(bundleDir, validName))).toBe(true);
+      }
     });
   });
 
