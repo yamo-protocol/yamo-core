@@ -285,6 +285,11 @@ export class YamoChainClient {
       const blockId = decoded.args[0] as string;
       return await this.getBlock(blockId);
     } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      console.error(`[YamoChainClient] getLatestBlock failed: ${errorMessage}`);
+      if (e instanceof Error && e.stack) {
+        console.error(`[YamoChainClient] Stack trace: ${e.stack}`);
+      }
       return null;
     }
   }
