@@ -1,6 +1,6 @@
 {
   "name": "@yamo/core",
-  "version": "1.2.7",
+  "version": "1.2.8",
   "description": "YAMO Protocol v0.4 - Core blockchain and IPFS library",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -28,6 +28,7 @@
   "author": "YAMO Protocol",
   "license": "MIT",
   "dependencies": {
+    "@yamo/core": "file:yamo-core-1.2.7.tgz",
     "axios": "^1.7.0",
     "chalk": "^4.1.2",
     "ethers": "^6.16.0",
