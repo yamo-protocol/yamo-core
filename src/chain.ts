@@ -7,6 +7,7 @@ export const YAMO_REGISTRY_ABI = [
   "function verifyBlock(string blockId, bytes32 contentHash) public view returns (bool)",
   "function blockCIDs(string) view returns (string)",
   "function blocks(string) view returns (string, string, address, bytes32, uint256, string, string)",
+  "function latestBlockHash() view returns (bytes32)",
   "event YAMOBlockSubmitted(string indexed blockId, string previousBlock, address indexed agent, bytes32 contentHash)",
   "event YAMOBlockSubmittedV2(string indexed blockId, bytes32 contentHash, string ipfsCID)"
 ];
@@ -102,6 +103,16 @@ export class YamoChainClient {
     } catch (e) {
       return null;
     }
+  }
+
+  /**
+   * Get the latest block's contentHash directly from contract state
+   * This is the recommended method for chain continuation
+   */
+  async getLatestBlockHash(): Promise<string> {
+    const contract = this.getContract(false);
+    const hash = await contract.latestBlockHash();
+    return hash;
   }
 
   async getLatestBlock(): Promise<{
