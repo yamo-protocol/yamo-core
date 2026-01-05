@@ -28,7 +28,6 @@
   "author": "YAMO Protocol",
   "license": "MIT",
   "dependencies": {
-    "@yamo/core": "file:yamo-core-1.2.7.tgz",
     "axios": "^1.7.0",
     "chalk": "^4.1.2",
     "ethers": "^6.16.0",
