@@ -67,7 +67,7 @@ export class YamoChainClient {
     console.log(chalk.yellow("Waiting for confirmation..."));
     await tx.wait();
     console.log(chalk.green(`Confirmed! Tx: ${tx.hash}`));
-    return tx.hash;
+    return tx;
   }
 
   async getBlock(blockId: string) {
