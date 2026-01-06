@@ -229,35 +229,48 @@ export class YamoChainClient {
       let latestEvent: ethers.EventLog | null = null;
       let latestBlockNumber = 0;
 
-      // Try V2 events first (with IPFS)
-      try {
-        const v2Filter = contract.filters.YAMOBlockSubmittedV2();
-        const v2Events = await contract.queryFilter(v2Filter);
+      const currentBlock = await this.provider.getBlockNumber();
+      const PAGE_SIZE = 40000; // Under most limits
+      const MAX_LOOKBACK = 200000; // 0.2M blocks ~ 1 month
+      const startBlock = Math.max(0, currentBlock - MAX_LOOKBACK);
 
-        for (const event of v2Events) {
+      // Helper for paginated query
+      const queryPaginated = async (filter: any) => {
+        let events: (ethers.EventLog | ethers.Log)[] = [];
+        for (let from = currentBlock; from > startBlock; from -= PAGE_SIZE) {
+            const to = from;
+            const fromActual = Math.max(startBlock, from - PAGE_SIZE);
+            try {
+                const batch = await contract.queryFilter(filter, fromActual, to);
+                if (batch.length > 0) {
+                    events = batch;
+                    break; // Found recent events in this batch
+                }
+            } catch (e) {
+                console.warn(`[YamoChainClient] Batch query failed (${fromActual}-${to}): ${e}`);
+            }
+        }
+        return events;
+      };
+
+      // Try V2 events first
+      const v2Events = await queryPaginated(contract.filters.YAMOBlockSubmittedV2());
+      
+      for (const event of v2Events) {
+        if (event instanceof ethers.EventLog && event.blockNumber > latestBlockNumber) {
+          latestBlockNumber = event.blockNumber;
+          latestEvent = event;
+        }
+      }
+
+      // If no V2 events found, try V1 events
+      if (!latestEvent) {
+        const v1Events = await queryPaginated(contract.filters.YAMOBlockSubmitted());
+        for (const event of v1Events) {
           if (event instanceof ethers.EventLog && event.blockNumber > latestBlockNumber) {
             latestBlockNumber = event.blockNumber;
             latestEvent = event;
           }
-        }
-      } catch (e) {
-        // V2 events might not exist, fall back to V1
-      }
-
-      // If no V2 events found or V2 didn't find any blocks, try V1 events
-      if (!latestEvent) {
-        try {
-          const v1Filter = contract.filters.YAMOBlockSubmitted();
-          const v1Events = await contract.queryFilter(v1Filter);
-
-          for (const event of v1Events) {
-            if (event instanceof ethers.EventLog && event.blockNumber > latestBlockNumber) {
-              latestBlockNumber = event.blockNumber;
-              latestEvent = event;
-            }
-          }
-        } catch (e) {
-          // V1 events might not exist either
         }
       }
 
@@ -290,7 +303,7 @@ export class YamoChainClient {
       if (e instanceof Error && e.stack) {
         console.error(`[YamoChainClient] Stack trace: ${e.stack}`);
       }
-      return null;
+      throw e;
     }
   }
 }
